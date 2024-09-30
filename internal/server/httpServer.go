@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/dicedb/dice/internal/worker"
 	"hash/crc32"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +37,7 @@ type HTTPServer struct {
 	httpServer         *http.Server
 	logger             *slog.Logger
 	qwatchResponseChan chan comm.QwatchResponse
-	shutdownChan       chan struct{}
+	shutdownChan       chan error
 }
 
 type HTTPQwatchResponse struct {
@@ -70,7 +72,7 @@ func NewHTTPServer(shardManager *shard.ShardManager, logger *slog.Logger) *HTTPS
 		httpServer:         srv,
 		logger:             logger,
 		qwatchResponseChan: make(chan comm.QwatchResponse),
-		shutdownChan:       make(chan struct{}),
+		shutdownChan:       make(chan error),
 	}
 
 	mux.HandleFunc("/", httpServer.DiceHTTPHandler)
@@ -125,6 +127,11 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 
 func (s *HTTPServer) DiceHTTPHandler(writer http.ResponseWriter, request *http.Request) {
 	// convert to REDIS cmd
+	clientIdentifierID := generateUniqueInt32(request)
+	s.shardManager.RegisterWorker(strconv.Itoa(int(clientIdentifierID)), s.ioChan)
+	defer func() {
+		s.shardManager.UnregisterWorker(strconv.Itoa(int(clientIdentifierID)))
+	}()
 	redisCmd, err := utils.ParseHTTPRequest(request)
 	if err != nil {
 		http.Error(writer, "Error parsing HTTP request", http.StatusBadRequest)
@@ -150,18 +157,17 @@ func (s *HTTPServer) DiceHTTPHandler(writer http.ResponseWriter, request *http.R
 		return
 	}
 
-	// send request to Shard Manager
-	s.shardManager.GetShard(0).ReqChan <- &ops.StoreOp{
-		Cmd:      redisCmd,
-		WorkerID: "httpServer",
-		ShardID:  0,
-		HTTPOp:   true,
+	execCommandDeps := &worker.ExecuteCommandDeps{
+		ShardManager:    s.shardManager,
+		WorkerID:        strconv.Itoa(int(clientIdentifierID)),
+		RespChan:        s.ioChan,
+		Logger:          s.logger,
+		GlobalErrorChan: s.shutdownChan,
 	}
 
-	// Wait for response
-	resp := <-s.ioChan
+	result, err := worker.ExecuteCommand(request.Context(), redisCmd, execCommandDeps, true, false)
 
-	s.writeResponse(writer, resp, redisCmd)
+	s.writeResponse(writer, result, redisCmd)
 }
 
 func (s *HTTPServer) DiceHTTPQwatchHandler(writer http.ResponseWriter, request *http.Request) {
@@ -215,8 +221,8 @@ func (s *HTTPServer) DiceHTTPQwatchHandler(writer http.ResponseWriter, request *
 	s.shardManager.GetShard(0).ReqChan <- storeOp
 
 	// Wait for 1st sync response from server for QWATCH and flush it to client
-	resp := <-s.ioChan
-	s.writeResponse(writer, resp, redisCmd)
+	_ = <-s.ioChan
+	//s.writeResponse(writer, resp, redisCmd)
 	flusher.Flush()
 	// Keep listening for context cancellation (client disconnect) and continuous responses
 	doneChan := request.Context().Done()
@@ -238,8 +244,8 @@ func (s *HTTPServer) DiceHTTPQwatchHandler(writer http.ResponseWriter, request *
 			}
 			storeOp.Cmd = unWatchCmd
 			s.shardManager.GetShard(0).ReqChan <- storeOp
-			resp := <-s.ioChan
-			s.writeResponse(writer, resp, redisCmd)
+			_ = <-s.ioChan
+			s.writeResponse(writer, nil, redisCmd)
 			return
 		}
 	}
@@ -296,7 +302,7 @@ func (s *HTTPServer) writeQWatchResponse(writer http.ResponseWriter, response co
 	flusher.Flush() // Flush the response to send it to the client
 }
 
-func (s *HTTPServer) writeResponse(writer http.ResponseWriter, result *ops.StoreResponse, redisCmd *cmd.RedisCmd) {
+func (s *HTTPServer) writeResponse(writer http.ResponseWriter, result *worker.CommandResponse, redisCmd *cmd.RedisCmd) {
 	_, ok := WorkerCmdsMeta[redisCmd.Cmd]
 	var rp *clientio.RESPParser
 
@@ -304,10 +310,10 @@ func (s *HTTPServer) writeResponse(writer http.ResponseWriter, result *ops.Store
 	// TODO: Remove this conditional check and if (true) condition when all commands are migrated
 	if !ok {
 		var err error
-		if result.EvalResponse.Error != nil {
-			rp = clientio.NewRESPParser(bytes.NewBuffer([]byte(result.EvalResponse.Error.Error())))
+		if result.Error != nil {
+			rp = clientio.NewRESPParser(bytes.NewBuffer([]byte(result.Error.Error())))
 		} else {
-			rp = clientio.NewRESPParser(bytes.NewBuffer(result.EvalResponse.Result.([]byte)))
+			rp = clientio.NewRESPParser(bytes.NewBuffer(result.ResponseData.([]byte)))
 		}
 
 		responseValue, err = rp.DecodeOne()
@@ -317,10 +323,10 @@ func (s *HTTPServer) writeResponse(writer http.ResponseWriter, result *ops.Store
 			return
 		}
 	} else {
-		if result.EvalResponse.Error != nil {
-			responseValue = result.EvalResponse.Error.Error()
+		if result.Error != nil {
+			responseValue = result.Error.Error()
 		} else {
-			responseValue = result.EvalResponse.Result
+			responseValue = result.ResponseData
 		}
 	}
 

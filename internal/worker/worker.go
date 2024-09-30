@@ -118,7 +118,7 @@ func (w *BaseWorker) Start(ctx context.Context) error {
 					return errors.Join(err, werr)
 				}
 			}
-			// executeCommand executes the command and return the response back to the client
+			// ExecuteCommand executes the command and return the response back to the client
 			func(errChan chan error) {
 				execctx, cancel := context.WithTimeout(ctx, 1*time.Second) // Timeout if
 				defer cancel()
@@ -136,174 +136,27 @@ func (w *BaseWorker) Start(ctx context.Context) error {
 }
 
 func (w *BaseWorker) executeCommand(ctx context.Context, redisCmd *cmd.RedisCmd) error {
-	// Break down the single command into multiple commands if multisharding is supported.
-	// The length of cmdList helps determine how many shards to wait for responses.
-	cmdList := make([]*cmd.RedisCmd, 0)
-
-	// Retrieve metadata for the command to determine if multisharding is supported.
-	meta, ok := CommandsMeta[redisCmd.Cmd]
-	if !ok {
-		// If no metadata exists, treat it as a single command and not migrated
-		cmdList = append(cmdList, redisCmd)
-	} else {
-		// Depending on the command type, decide how to handle it.
-		switch meta.CmdType {
-		case Global:
-			// If it's a global command, process it immediately without involving any shards.
-			err := w.ioHandler.Write(ctx, meta.WorkerCommandHandler(redisCmd.Args))
-			w.logger.Debug("Error executing for worker", slog.String("workerID", w.id), slog.Any("error", err))
-			return err
-
-		case SingleShard:
-			// For single-shard or custom commands, process them without breaking up.
-			cmdList = append(cmdList, redisCmd)
-
-		case MultiShard:
-			// If the command supports multisharding, break it down into multiple commands.
-			cmdList = meta.decomposeCommand(redisCmd)
-		case Custom:
-			switch redisCmd.Cmd {
-			case CmdAuth:
-				err := w.ioHandler.Write(ctx, w.RespAuth(redisCmd.Args))
-				w.logger.Error("Error sending auth response to worker", slog.String("workerID", w.id), slog.Any("error", err))
-				return err
-			case CmdAbort:
-				w.logger.Info("Received ABORT command, initiating server shutdown", slog.String("workerID", w.id))
-				w.globalErrorChan <- diceerrors.ErrAborted
-				return nil
-			default:
-				cmdList = append(cmdList, redisCmd)
-			}
-		}
+	deps := &ExecuteCommandDeps{
+		ShardManager:    w.shardManager,
+		WorkerID:        w.id,
+		RespChan:        w.respChan,
+		Logger:          w.logger,
+		GlobalErrorChan: w.globalErrorChan,
 	}
-
-	// Scatter the broken-down commands to the appropriate shards.
-	err := w.scatter(ctx, cmdList)
+	result, err := ExecuteCommand(ctx, redisCmd, deps, false, false)
+	// Write the result back to the client
 	if err != nil {
 		return err
 	}
 
-	// Gather the responses from the shards and write them to the buffer.
-	err = w.gather(ctx, redisCmd.Cmd, len(cmdList), meta.CmdType)
-	if err != nil {
+	switch result.Action {
+	case CmdPing:
+		meta := CommandsMeta[redisCmd.Cmd]
+		err := w.ioHandler.Write(ctx, meta.WorkerCommandHandler(redisCmd.Args))
 		return err
-	}
-
-	return nil
-}
-
-// scatter distributes the Redis commands to the respective shards based on the key.
-// For each command, it calculates the shard ID and sends the command to the shard's request channel for processing.
-func (w *BaseWorker) scatter(ctx context.Context, cmds []*cmd.RedisCmd) error {
-	// Otherwise check for the shard based on the key using hash
-	// and send it to the particular shard
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		for i := uint8(0); i < uint8(len(cmds)); i++ {
-			var rc chan *ops.StoreOp
-			var sid shard.ShardID
-			var key string
-			if len(cmds[i].Args) > 0 {
-				key = cmds[i].Args[0]
-			} else {
-				key = cmds[i].Cmd
-			}
-
-			sid, rc = w.shardManager.GetShardInfo(key)
-
-			rc <- &ops.StoreOp{
-				SeqID:     i,
-				RequestID: cmds[i].RequestID,
-				Cmd:       cmds[i],
-				WorkerID:  w.id,
-				ShardID:   sid,
-				Client:    nil,
-			}
-		}
-	}
-
-	return nil
-}
-
-// gather collects the responses from multiple shards and writes the results into the provided buffer.
-// It first waits for responses from all the shards and then processes the result based on the command type (SingleShard, Custom, or Multishard).
-func (w *BaseWorker) gather(ctx context.Context, c string, numCmds int, ct CmdType) error {
-	// Loop to wait for messages from numberof shards
-	var evalResp []eval.EvalResponse
-	for numCmds != 0 {
-		select {
-		case <-ctx.Done():
-			w.logger.Error("Timed out waiting for response from shards", slog.String("workerID", w.id), slog.Any("error", ctx.Err()))
-		case resp, ok := <-w.respChan:
-			if ok {
-				evalResp = append(evalResp, *resp.EvalResponse)
-			}
-			numCmds--
-			continue
-		case sError, ok := <-w.shardManager.ShardErrorChan:
-			if ok {
-				w.logger.Error("Error from shard", slog.String("workerID", w.id), slog.Any("error", sError))
-			}
-		}
-	}
-
-	// TODO: This is a temporary solution. In the future, all commands should be refactored to be multi-shard compatible.
-	// TODO: There are a few commands such as QWATCH, RENAME, MGET, MSET that wouldn't work in multi-shard mode without refactoring.
-	// TODO: These commands should be refactored to be multi-shard compatible before DICE-DB is completely multi-shard.
-	// Check if command is part of the new WorkerCommandsMeta map i.e. if the command has been refactored to be multi-shard compatible.
-	// If not found, treat it as a command that's not yet refactored, and write the response back to the client.
-	val, ok := CommandsMeta[c]
-	if !ok {
-		if evalResp[0].Error != nil {
-			err := w.ioHandler.Write(ctx, []byte(evalResp[0].Error.Error()))
-			if err != nil {
-				w.logger.Debug("Error sending response to client", slog.String("workerID", w.id), slog.Any("error", err))
-				return err
-			}
-		}
-
-		err := w.ioHandler.Write(ctx, evalResp[0].Result.([]byte))
-		if err != nil {
-			w.logger.Debug("Error sending response to client", slog.String("workerID", w.id), slog.Any("error", err))
-			return err
-		}
-
-		return nil
-	}
-
-	switch ct {
-	case SingleShard, Custom:
-		if evalResp[0].Error != nil {
-			err := w.ioHandler.Write(ctx, evalResp[0].Error)
-			if err != nil {
-				w.logger.Debug("Error sending response to client", slog.String("workerID", w.id), slog.Any("error", err))
-			}
-
-			return err
-		}
-
-		err := w.ioHandler.Write(ctx, evalResp[0].Result)
-		if err != nil {
-			w.logger.Debug("Error sending response to client", slog.String("workerID", w.id), slog.Any("error", err))
-			return err
-		}
-
-	case MultiShard:
-		err := w.ioHandler.Write(ctx, val.composeResponse(evalResp...))
-		if err != nil {
-			w.logger.Debug("Error sending response to client", slog.String("workerID", w.id), slog.Any("error", err))
-			return err
-		}
-
-	default:
-		w.logger.Error("Unknown command type", slog.String("workerID", w.id))
-		err := w.ioHandler.Write(ctx, diceerrors.ErrInternalServer)
-		if err != nil {
-			w.logger.Debug("Error sending response to client", slog.String("workerID", w.id), slog.Any("error", err))
-			return err
-		}
+	case CmdAuth:
+		err := w.ioHandler.Write(ctx, w.RespAuth(redisCmd.Args))
+		return err
 	}
 
 	return nil
@@ -349,4 +202,162 @@ func (w *BaseWorker) Stop() error {
 	w.logger.Info("Stopping worker", slog.String("workerID", w.id))
 	w.Session.Expire()
 	return nil
+}
+
+type ExecuteCommandDeps struct {
+	ShardManager    *shard.ShardManager
+	WorkerID        string
+	RespChan        chan *ops.StoreResponse
+	Logger          *slog.Logger
+	GlobalErrorChan chan error
+}
+
+type CommandResponse struct {
+	ResponseData interface{}
+	Error        error
+	Action       string
+	Args         []string
+}
+
+func ExecuteCommand(ctx context.Context, redisCmd *cmd.RedisCmd, deps *ExecuteCommandDeps, isHttpOp, isWebsocketOp bool) (*CommandResponse, error) {
+	cmdList := make([]*cmd.RedisCmd, 0)
+	meta, ok := CommandsMeta[redisCmd.Cmd]
+	if !ok {
+		cmdList = append(cmdList, redisCmd)
+	} else {
+		switch meta.CmdType {
+		case Global:
+			return handleGlobalCommand(redisCmd)
+		case Custom:
+			return handleCustomCommand(redisCmd, deps)
+		case SingleShard:
+			cmdList = append(cmdList, redisCmd)
+		case MultiShard:
+			cmdList = meta.decomposeCommand(redisCmd)
+		}
+	}
+
+	err := scatter(ctx, cmdList, deps, isHttpOp, isWebsocketOp)
+	if err != nil {
+		return nil, err
+	}
+
+	responseData, err := gather(ctx, redisCmd.Cmd, len(cmdList), meta.CmdType, deps)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CommandResponse{ResponseData: responseData}, nil
+}
+
+func handleGlobalCommand(redisCmd *cmd.RedisCmd) (*CommandResponse, error) {
+	return &CommandResponse{Args: redisCmd.Args, Action: CmdPing}, nil
+}
+
+func handleCustomCommand(redisCmd *cmd.RedisCmd, deps *ExecuteCommandDeps) (*CommandResponse, error) {
+	switch redisCmd.Cmd {
+	case CmdAuth:
+		return &CommandResponse{Args: redisCmd.Args, Action: CmdAuth}, nil
+	case CmdAbort:
+		deps.Logger.Info("Received ABORT command, initiating server shutdown", slog.String("workerID", deps.WorkerID))
+		// Send the abort error to the global error channel
+		deps.GlobalErrorChan <- diceerrors.ErrAborted
+		return &CommandResponse{}, nil
+	default:
+		return nil, fmt.Errorf("unknown custom command: %s", redisCmd.Cmd)
+	}
+}
+
+func scatter(ctx context.Context, cmds []*cmd.RedisCmd, deps *ExecuteCommandDeps, isHttpOp, isWebsocketOp bool) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		for i := uint8(0); i < uint8(len(cmds)); i++ {
+			var rc chan *ops.StoreOp
+			var sid shard.ShardID
+			var key string
+			if len(cmds[i].Args) > 0 {
+				key = cmds[i].Args[0]
+			} else {
+				key = cmds[i].Cmd
+			}
+
+			sid, rc = deps.ShardManager.GetShardInfo(key)
+			if rc == nil {
+				deps.Logger.Error("Shard channel is nil", slog.String("workerID", deps.WorkerID), slog.Any("key", key))
+				return fmt.Errorf("shard channel is nil for key: %s", key)
+			}
+
+			rc <- &ops.StoreOp{
+				SeqID:     i,
+				RequestID: cmds[i].RequestID,
+				Cmd:       cmds[i],
+				WorkerID:  deps.WorkerID,
+				ShardID:   sid,
+				Client:    nil,
+				HTTPOp: isHttpOp,
+				WebsocketOp: isWebsocketOp,
+			}
+		}
+	}
+
+	return nil
+}
+
+func gather(ctx context.Context, c string, numCmds int, ct CmdType, deps *ExecuteCommandDeps) (interface{}, error) {
+	var evalResp []eval.EvalResponse
+	for numCmds != 0 {
+		select {
+		case <-ctx.Done():
+			deps.Logger.Error("Timed out waiting for response from shards", slog.String("workerID", deps.WorkerID), slog.Any("error", ctx.Err()))
+			return nil, ctx.Err()
+		case resp, ok := <-deps.RespChan:
+			if ok {
+				evalResp = append(evalResp, *resp.EvalResponse)
+			} else {
+				deps.Logger.Warn("Response channel closed", slog.String("workerID", deps.WorkerID))
+				numCmds--
+			}
+			numCmds--
+		case sError, ok := <-deps.ShardManager.ShardErrorChan:
+			if ok {
+				deps.Logger.Error("Error from shard", slog.String("workerID", deps.WorkerID), slog.Any("error", sError))
+			}
+		}
+	}
+
+	// Process the responses based on the command type
+	val, ok := CommandsMeta[c]
+	if !ok {
+		// If the command is not in CommandsMeta, handle it as a default case
+		if len(evalResp) == 0 {
+			return nil, fmt.Errorf("no response from shards for command: %s", c)
+		}
+		if evalResp[0].Error != nil {
+			return nil, evalResp[0].Error
+		}
+
+		return evalResp[0].Result, nil
+	}
+
+	// Handle based on command type
+	switch ct {
+	case SingleShard, Custom:
+		if len(evalResp) == 0 {
+			return nil, fmt.Errorf("no response from shards for command: %s", c)
+		}
+		if evalResp[0].Error != nil {
+			return nil, evalResp[0].Error
+		}
+
+		return evalResp[0].Result, nil
+	case MultiShard:
+		// For MultiShard commands, compose the response from multiple shard responses
+		responseData := val.composeResponse(evalResp...)
+		return responseData, nil
+	default:
+		deps.Logger.Error("Unknown command type", slog.String("workerID", deps.WorkerID), slog.String("command", c))
+		return nil, diceerrors.ErrInternalServer
+	}
 }

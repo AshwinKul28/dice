@@ -2818,10 +2818,10 @@ func evalPersist(args []string, store *dstore.Store) []byte {
 		return clientio.RespZero
 	}
 
-	// If the object exists but no expiration is set on it, return -1
+	// If the object exists but no expiration is set on it, return 0
 	_, isExpirySet := dstore.GetExpiry(obj, store)
 	if !isExpirySet {
-		return clientio.RespMinusOne
+		return clientio.RespZero
 	}
 
 	// If the object exists, remove the expiration time
@@ -4761,7 +4761,7 @@ func evalZADD(args []string, store *dstore.Store) []byte {
 	}
 
 	obj = store.NewObj(ss, -1, object.ObjTypeSortedSet, object.ObjEncodingBTree)
-	store.Put(key, obj)
+	store.Put(key, obj, dstore.WithPutCmd(dstore.ZAdd))
 
 	return clientio.Encode(added, false)
 }
